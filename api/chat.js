@@ -1,71 +1,92 @@
-// api/gemini-proxy.js
-
 export default async function handler(req, res) {
-  // --- CORS: ALLOW ALL ORIGINS ---
+  // --- CORS ---
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Credentials", "false");
 
-  // Preflight
   if (req.method === "OPTIONS") {
     res.status(200).end();
     return;
   }
 
-  // Only allow POST for actual usage
   if (req.method !== "POST") {
-    res.status(405).json({ error: "Method not allowed. Use POST." });
+    res.status(405).end("Method Not Allowed");
     return;
   }
 
-  const { prompt, model = "models/gemini-2.5-flash-preview-09-2025" } = req.body || {};
-
+  const { prompt } = req.body || {};
   if (!prompt) {
-    res.status(400).json({ error: "Missing 'prompt' in request body." });
+    res.status(400).end("Missing prompt");
     return;
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    res.status(500).json({
-      error: "Server is missing GEMINI_API_KEY environment variable.",
-    });
+    res.status(500).end("Missing GEMINI_API_KEY");
     return;
   }
 
+  // 🔴 IMPORTANT: streaming headers MUST be set BEFORE writing
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+  });
+
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/${model}:generateContent?key=${apiKey}`;
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:streamGenerateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      }
+    );
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-      }),
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      res.status(response.status).json({
-        error: "Gemini API error",
-        details: errText,
-      });
+    if (!geminiRes.ok || !geminiRes.body) {
+      res.write(`event: error\ndata: Gemini API error\n\n`);
+      res.end();
       return;
     }
 
-    const data = await response.json();
+    const reader = geminiRes.body.getReader();
+    const decoder = new TextDecoder();
 
-    const text =
-      data?.candidates?.[0]?.content?.parts
-        ?.map((p) => p.text || "")
-        .join("") || "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
 
-    res.status(200).json({ text, raw: data });
+      const chunk = decoder.decode(value, { stream: true });
+
+      // Gemini sends JSON objects per line
+      const lines = chunk.split("\n").filter(Boolean);
+
+      for (const line of lines) {
+        try {
+          const json = JSON.parse(line);
+          const text =
+            json?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+          if (text) {
+            // 🔥 STREAM TO CLIENT IMMEDIATELY
+            res.write(`data: ${text}\n\n`);
+          }
+        } catch {
+          // Ignore partial JSON fragments
+        }
+      }
+    }
+
+    res.write(`data: [DONE]\n\n`);
+    res.end();
   } catch (err) {
-    res.status(500).json({
-      error: "Internal server error calling Gemini",
-      details: err.message,
-    });
+    console.error(err);
+    try {
+      res.write(`event: error\ndata: ${err.message}\n\n`);
+      res.end();
+    } catch {}
   }
 }
